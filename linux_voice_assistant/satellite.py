@@ -61,6 +61,7 @@ from .entity import (
     WakeWord1SensitivityNumberEntity,
     WakeWord2SensitivityNumberEntity,
 )
+from .gain_controller import SATELLITE_REASON
 from .models import AvailableWakeWord, ServerState, WakeWordType
 from .peripheral_api import LVAEvent
 from .util import call_all
@@ -117,6 +118,7 @@ class VoiceSatelliteProtocol(APIServer):
                 music_player=state.music_player,
                 announce_player=state.tts_player,
                 initial_volume=state.volume,
+                gain_controller=getattr(state, "gain_controller", None),
             )
             self.state.entities.append(self.state.media_player_entity)
         elif self.state.media_player_entity not in self.state.entities:
@@ -968,10 +970,21 @@ class VoiceSatelliteProtocol(APIServer):
 
     def duck(self) -> None:
         _LOGGER.debug("Ducking music")
+        controller = getattr(self.state, "gain_controller", None)
+        if controller is not None:
+            # Acquire/renew the voice-pipeline lease. Composes with external
+            # leases (e.g. the doorbell); releasing one does not release the
+            # other (#356).
+            controller.duck(SATELLITE_REASON)
+            return
         self.state.music_player.duck()
 
     def unduck(self) -> None:
         _LOGGER.debug("Unducking music")
+        controller = getattr(self.state, "gain_controller", None)
+        if controller is not None:
+            controller.unduck(SATELLITE_REASON)
+            return
         self.state.music_player.unduck()
 
     # ------------------------------------------------------------------

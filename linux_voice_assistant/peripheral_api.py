@@ -357,8 +357,7 @@ class PeripheralAPIServer:
             new_vol = max(0.0, min(1.0, state.volume + delta))
             vol_pct = int(round(new_vol * 100))
 
-            state.music_player.set_volume(vol_pct)
-            state.tts_player.set_volume(vol_pct)
+            self._apply_media_volume(state, new_vol, vol_pct)
 
             if state.media_player_entity is not None:
                 state.media_player_entity.volume = new_vol
@@ -391,8 +390,7 @@ class PeripheralAPIServer:
             new_vol = max(0.0, min(1.0, float(volume)))
             vol_pct = int(round(new_vol * 100))
 
-            state.music_player.set_volume(vol_pct)
-            state.tts_player.set_volume(vol_pct)
+            self._apply_media_volume(state, new_vol, vol_pct)
 
             if state.media_player_entity is not None:
                 state.media_player_entity.volume = new_vol
@@ -479,6 +477,20 @@ class PeripheralAPIServer:
 
         elif command == LVACommand.REGISTER_BUTTON:
             self._register_button(satellite)
+
+    def _apply_media_volume(self, state: "ServerState", new_vol: float, vol_pct: int) -> None:
+        """Route a peripheral volume change through the shared gain controller.
+
+        The controller owns the persisted volume and the bounded speech /
+        ducked music gains; without one (older callers) fall back to writing
+        both players directly.
+        """
+        controller = getattr(state, "gain_controller", None)
+        if controller is not None:
+            controller.set_media_volume(new_vol)
+        else:
+            state.music_player.set_volume(vol_pct)
+            state.tts_player.set_volume(vol_pct)
 
     def _register_light(self, data: Dict[str, Any], satellite: Any) -> None:
         """Register a Light declared by a peripheral.

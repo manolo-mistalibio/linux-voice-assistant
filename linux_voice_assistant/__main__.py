@@ -4,6 +4,7 @@ import asyncio
 import errno
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -18,6 +19,8 @@ from getmac import get_mac_address  # type: ignore
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
+from .duck_control import DuckControlServer
+from .gain_controller import GainController
 from .models import Preferences, ServerState, WakeWordType
 from .mpv_player import MpvMediaPlayer
 from .peripheral_api import LVAEvent, PeripheralAPIServer
@@ -227,6 +230,44 @@ async def main() -> None:
         type=float,
         default=900.0,  # 15 minutes
         help="Seconds before a ringing timer auto-stops (default: 900)",
+    )
+    # ------------------------------------------------------------------
+    # Speech bounds and external duck leasing (#356)
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--notification-min-volume",
+        type=float,
+        default=0.30,
+        help="Lower bound for speech/notification gain as a fraction (default: 0.30; listening-test tuning value)",
+    )
+    parser.add_argument(
+        "--notification-max-volume",
+        type=float,
+        default=0.70,
+        help="Upper bound for speech/notification gain as a fraction (default: 0.70; listening-test tuning value)",
+    )
+    parser.add_argument(
+        "--music-duck-ratio",
+        type=float,
+        default=0.5,
+        help="Music gain factor while ducked, 0.0-1.0 (default: 0.5)",
+    )
+    parser.add_argument(
+        "--duck-control-host",
+        default="127.0.0.1",
+        help="Bind address for the authenticated external-duck control API (default: loopback). Set to a LAN address only together with LVA_DUCK_TOKEN.",
+    )
+    parser.add_argument(
+        "--duck-control-port",
+        type=int,
+        default=6060,
+        help="Port for the external-duck control API (default: 6060)",
+    )
+    parser.add_argument(
+        "--duck-max-seconds",
+        type=float,
+        default=300.0,
+        help="Maximum external duck lease duration in seconds (default: 300)",
     )
     parser.add_argument(
         "--listen-during-wake-sound",
@@ -461,9 +502,20 @@ async def main() -> None:
     if args.enable_thinking_sound or args.mic_auto_gain or args.mic_noise_suppression:
         state.save_preferences()
 
-    initial_volume_percent = int(round(initial_volume * 100))
-    state.music_player.set_volume(initial_volume_percent)
-    state.tts_player.set_volume(initial_volume_percent)
+    # Single gain controller (#356): owns the persisted media volume, the
+    # bounded speech gain and the named duck leases. Route every volume write
+    # (HA entity, peripheral API, startup) through it instead of touching the
+    # players directly, so speech stays intelligible and ducking composes.
+    gain_controller = GainController(
+        state.music_player,
+        state.tts_player,
+        duck_ratio=args.music_duck_ratio,
+        speech_min=args.notification_min_volume,
+        speech_max=args.notification_max_volume,
+        max_lease_seconds=args.duck_max_seconds,
+    )
+    state.gain_controller = gain_controller
+    gain_controller.set_media_volume(initial_volume)
 
     # ------------------------------------------------------------------
     # Peripheral API (optional – LEDs, buttons, HAT boards)
@@ -575,6 +627,38 @@ async def main() -> None:
             )
             await asyncio.sleep(args.peripheral_startup_wait)
 
+    # ------------------------------------------------------------------
+    # Authenticated external-duck control (#356). Never expose this without a
+    # token: a missing LVA_DUCK_TOKEN disables the endpoint entirely rather
+    # than opening an anonymous LAN control surface.
+    # ------------------------------------------------------------------
+    duck_control: Optional[DuckControlServer] = None
+    duck_token = os.environ.get("LVA_DUCK_TOKEN", "").strip()
+    if duck_token:
+        loopback = args.duck_control_host in ("127.0.0.1", "::1", "localhost")
+        if not loopback:
+            _LOGGER.warning(
+                "Duck control is bound to %s (non-loopback); it is token-authenticated but reachable on the LAN",
+                args.duck_control_host,
+            )
+        duck_control = DuckControlServer(
+            gain_controller,
+            duck_token,
+            host=args.duck_control_host,
+            port=args.duck_control_port,
+        )
+        try:
+            duck_control.start()
+        except OSError:
+            _LOGGER.exception(
+                "Could not start duck control on %s:%d – external ducking disabled",
+                args.duck_control_host,
+                args.duck_control_port,
+            )
+            duck_control = None
+    else:
+        _LOGGER.info("LVA_DUCK_TOKEN not set – external duck control disabled")
+
     try:
         async with server:  # type: ignore[union-attr]
             _LOGGER.info("Server started (host=%s, port=%s)", host_ip_address, args.port)
@@ -584,6 +668,8 @@ async def main() -> None:
     finally:
         state.audio_queue.put_nowait(None)
         process_audio_thread.join()
+        if duck_control is not None:
+            duck_control.stop()
         if peripheral_api is not None:
             await peripheral_api.stop()
 

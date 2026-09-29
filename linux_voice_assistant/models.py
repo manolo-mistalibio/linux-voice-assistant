@@ -26,6 +26,7 @@ if TYPE_CHECKING:
         WakeWord1SensitivityNumberEntity,
         WakeWord2SensitivityNumberEntity,
     )
+    from .gain_controller import GainController
     from .mpv_player import MpvMediaPlayer
     from .satellite import VoiceSatelliteProtocol
 
@@ -126,6 +127,10 @@ class ServerState:
     continue_conversation_delay: float = 0.5  # seconds to wait after TTS before opening mic
 
     media_player_entity: "Optional[MediaPlayerEntity]" = None
+    # Single gain controller that owns bounded speech gain and named duck
+    # leases (#356). Assigned in __main__ right after the players exist; the
+    # entity/peripheral/satellite paths route all volume writes through it.
+    gain_controller: "Optional[GainController]" = None
     satellite: "Optional[VoiceSatelliteProtocol]" = None
     connections: "List[VoiceSatelliteProtocol]" = field(default_factory=list)
     mute_switch_entity: "Optional[MuteSwitchEntity]" = None

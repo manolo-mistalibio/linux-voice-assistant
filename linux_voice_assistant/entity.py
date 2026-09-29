@@ -36,6 +36,7 @@ from aioesphomeapi.model import (
 from google.protobuf import message
 
 from .api_server import APIServer
+from .gain_controller import GainController
 from .mpv_player import MpvMediaPlayer
 from .util import call_all
 
@@ -73,6 +74,7 @@ class MediaPlayerEntity(ESPHomeEntity):
         announce_player: MpvMediaPlayer,
         initial_volume: float = 1.0,
         on_volume_changed: Optional[Callable[[float], None]] = None,
+        gain_controller: Optional[GainController] = None,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
 
@@ -86,6 +88,17 @@ class MediaPlayerEntity(ESPHomeEntity):
         self.music_player = music_player
         self.announce_player = announce_player
         self._on_volume_changed = on_volume_changed
+        # All effective gains flow through one controller (#356). The satellite
+        # injects the shared, configured controller; when a caller does not
+        # supply one (unit tests, embedding) build a neutral pass-through so a
+        # bare entity behaves exactly as the upstream release did.
+        self.gain_controller = gain_controller or GainController(
+            music_player,
+            announce_player,
+            speech_min=0.0,
+            speech_max=1.0,
+            autostart=False,
+        )
         self.apply_volume_from_state(initial_volume)
         self._log = logging.getLogger(f"{self.__class__.__name__}[{self.key}]")
 
@@ -179,8 +192,9 @@ class MediaPlayerEntity(ESPHomeEntity):
                     if not self.muted:
                         self.previous_volume = self.volume
                         self.volume = 0
-                        self.music_player.set_volume(0)
-                        self.announce_player.set_volume(0)
+                        # Mute means silence on both players; the gain
+                        # controller keeps V so unmute restores the level.
+                        self.gain_controller.set_muted(True)
                         self.muted = True
                     yield self._update_state(self.state)
 
@@ -188,8 +202,11 @@ class MediaPlayerEntity(ESPHomeEntity):
                     self._log.debug("Executing UNMUTE")
                     if self.muted:
                         self.volume = self.previous_volume
-                        self.music_player.set_volume(int(self.volume * 100))
-                        self.announce_player.set_volume(int(self.volume * 100))
+                        # Restore the remembered level on the controller too, so
+                        # the entity's reported volume and the gains agree even
+                        # if the volume moved while muted.
+                        self.gain_controller.set_media_volume(self.previous_volume)
+                        self.gain_controller.set_muted(False)
                         self.muted = False
                     yield self._update_state(self.state)
 
@@ -256,10 +273,10 @@ class MediaPlayerEntity(ESPHomeEntity):
         remember: bool = True,
     ) -> None:
         normalized = max(0.0, min(1.0, float(volume)))
-        volume_percent = int(round(normalized * 100))
 
-        self.music_player.set_volume(volume_percent)
-        self.announce_player.set_volume(volume_percent)
+        # The controller owns the persisted media volume and pushes bounded
+        # speech / ducked music gains to both players.
+        self.gain_controller.set_media_volume(normalized)
 
         self.volume = normalized
 
